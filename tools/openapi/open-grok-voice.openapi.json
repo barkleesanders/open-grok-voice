@@ -1,0 +1,2032 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "open-grok-voice",
+    "version": "1.1.0",
+    "description": "Outbound AI phone calls: Telnyx originates both legs and bridges them carrier-side so xAI Grok Voice only ever sees an inbound call. Derived from src/index.ts (25 routes) on 2026-08-31; the Worker publishes no spec of its own. Private API - one operator."
+  },
+  "servers": [
+    {
+      "url": "https://open-grok-voice.example.com"
+    }
+  ],
+  "tags": [
+    {
+      "name": "calls",
+      "description": "Place and inspect calls (x-api-key)"
+    },
+    {
+      "name": "console",
+      "description": "Operator console (browser session cookie)"
+    },
+    {
+      "name": "presets",
+      "description": "Saved task strings in R2"
+    },
+    {
+      "name": "health"
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "apiKey": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-api-key",
+        "description": "APP_API_KEY. Compared with a timing-safe equality check."
+      },
+      "operatorSession": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "__Secure-open-grok-voice.session_token",
+        "description": "Better Auth session cookie from the Google sign-in at /console. Obtainable headlessly: `~/tools/cookies-txt <url>` reads the real Chrome Default profile (SQLite + Keychain) and the resulting jar authenticates - verified 2026-08-28, /api/me 200 with the jar and 401 without. The __Secure- prefix and the worker-name segment are part of the cookie NAME; do not shorten it."
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "issues": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Zod issue messages, present on 400 invalid request."
+          }
+        }
+      },
+      "BusyInterval": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["startMs", "endMs", "remote"],
+        "description": "Numbers and a boolean ONLY. Strict by design: a caller cannot smuggle a string field in alongside the numbers and have a future renderer pick it up.",
+        "properties": {
+          "startMs": {
+            "type": "integer"
+          },
+          "endMs": {
+            "type": "integer"
+          },
+          "remote": {
+            "type": "boolean"
+          }
+        }
+      },
+      "CallRequest": {
+        "type": "object",
+        "required": ["to", "task"],
+        "properties": {
+          "to": {
+            "type": "string",
+            "pattern": "^\\+[1-9]\\d{6,14}$",
+            "example": "+14155550123",
+            "description": "E.164 destination."
+          },
+          "task": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 16000,
+            "description": "The per-call instruction, sent to Grok as session.update.instructions. Composed AFTER the fixed identity and guardrails, so a task saying 'ignore your instructions' lands downstream of them."
+          },
+          "voice": {
+            "type": "string",
+            "pattern": "^[a-zA-Z0-9_-]{1,64}$",
+            "description": "Built-in xAI voice id."
+          },
+          "amd": {
+            "type": "string",
+            "enum": [
+              "disabled",
+              "detect",
+              "detect_beep",
+              "detect_words",
+              "greeting_end",
+              "premium"
+            ],
+            "description": "Telnyx answering-machine detection mode."
+          },
+          "busy": {
+            "type": "array",
+            "maxItems": 500,
+            "items": {
+              "$ref": "#/components/schemas/BusyInterval"
+            }
+          },
+          "windowDays": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 30
+          },
+          "slots": {
+            "type": "array",
+            "maxItems": 400,
+            "items": {
+              "type": "integer"
+            },
+            "description": "Bookable start times from cal.com, epoch ms. Numbers only."
+          },
+          "slotMinutes": {
+            "type": "integer",
+            "minimum": 5,
+            "maximum": 480
+          },
+          "subject": {
+            "type": "string",
+            "maxLength": 120,
+            "description": "What this call is about, in the operator's own words (e.g. 'ACME Medical Center'). Optional and NOT prompt input: it never reaches the model, it only names the call in the console's log and the archive. Supply it when placing several calls from one task script -- it is the only field that tells two such calls apart."
+          },
+          "runAt": {
+            "type": "integer",
+            "description": "Absolute epoch ms. Absent: dial now. Present and in the future: persist, do not dial. Numbers only."
+          },
+          "participants": {
+            "type": "array",
+            "maxItems": 4,
+            "items": {
+              "type": "string",
+              "pattern": "^\\+[1-9]\\d{6,14}$"
+            },
+            "description": "Numbers to conference in as soon as the call connects. Dialed only AFTER the conference exists, so a call that never answers never rings them."
+          },
+          "calcomEventTypeSlug": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]{0,63}$",
+            "example": "30mins",
+            "description": "cal.com event-type slug. Stored on a DEFERRED job so its slots are RE-RESOLVED at dial time instead of replayed from a snapshot. Never reaches the prompt: it is one query parameter on a fixed host."
+          },
+          "timeZone": {
+            "type": "string",
+            "maxLength": 64,
+            "example": "America/Los_Angeles",
+            "description": "IANA zone the runAt was chosen in. Defaults to America/Los_Angeles. A runAt whose LOCAL hour falls outside 09:00-18:00 in this zone is refused with 400."
+          }
+        }
+      },
+      "ConsoleCallRequest": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/CallRequest"
+          },
+          {
+            "type": "object",
+            "required": ["recordingNoticeAcknowledged"],
+            "properties": {
+              "recordingNoticeAcknowledged": {
+                "type": "boolean",
+                "const": true,
+                "description": "The console must explicitly acknowledge the recording notice."
+              }
+            }
+          }
+        ]
+      },
+      "CallAccepted": {
+        "type": "object",
+        "required": ["callId", "status"],
+        "properties": {
+          "callId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status": {
+            "type": "string",
+            "const": "dialing"
+          }
+        }
+      },
+      "CallLogListRow": {
+        "type": "object",
+        "properties": {
+          "callId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "phase": {
+            "type": "string"
+          },
+          "to": {
+            "type": "string",
+            "description": "REDACTED remote number - a full E.164 is never archived or shown."
+          },
+          "startedAt": {
+            "type": "integer"
+          },
+          "endedAt": {
+            "type": "integer"
+          },
+          "durationMs": {
+            "type": "integer"
+          },
+          "subject": {
+            "type": ["string", "null"],
+            "description": "The operator's subject, or one derived from the task when none was given. null when the object records no provenance -- see subjectSource, which must be read alongside this."
+          },
+          "subjectSource": {
+            "type": ["string", "null"],
+            "enum": ["operator", "derived", null],
+            "description": "Who wrote `subject`. 'operator' is a label a human typed for THIS call and identifies it; 'derived' is a machine summary of the task, which a campaign reuses across every target, so it identifies the SCRIPT and not the call. null means the record never recorded its provenance (written before this field, or awaiting POST /api/console/calls/backfill-subjects) -- treat it as 'derived', never as 'operator'. Read this WITH `subject`: a client that renders the label without it cannot tell a name from a guess, which is the regression this field exists to prevent."
+          }
+        }
+      },
+      "CallLogPage": {
+        "type": "object",
+        "required": ["calls", "cursor"],
+        "properties": {
+          "calls": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CallLogListRow"
+            }
+          },
+          "cursor": {
+            "type": ["string", "null"],
+            "description": "Opaque continuation token; null on the last page. Rows are newest-first because the R2 key encodes a DESCENDING clock - R2 list() is lexicographic ascending with no reverse."
+          }
+        }
+      },
+      "CallLogRecord": {
+        "type": "object",
+        "properties": {
+          "schema": {
+            "type": "integer",
+            "const": 1
+          },
+          "callId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "phase": {
+            "type": "string"
+          },
+          "direction": {
+            "type": "string"
+          },
+          "inboundMode": {
+            "type": ["string", "null"]
+          },
+          "to": {
+            "type": "string",
+            "description": "Redacted."
+          },
+          "task": {
+            "type": "string"
+          },
+          "voice": {
+            "type": "string"
+          },
+          "amdResult": {
+            "type": ["string", "null"]
+          },
+          "failureReason": {
+            "type": ["string", "null"]
+          },
+          "inboundFallbackReason": {
+            "type": ["string", "null"]
+          },
+          "forwardAttempted": {
+            "type": "integer"
+          },
+          "startedAt": {
+            "type": "integer"
+          },
+          "endedAt": {
+            "type": "integer"
+          },
+          "durationMs": {
+            "type": "integer"
+          },
+          "teardownReason": {
+            "type": "string"
+          },
+          "recordings": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "format": {
+                  "type": "string"
+                },
+                "channels": {
+                  "type": "string"
+                },
+                "archivedKey": {
+                  "type": ["string", "null"],
+                  "description": "R2 key, or null when archival has not completed."
+                }
+              }
+            }
+          },
+          "subject": {
+            "type": ["string", "null"],
+            "description": "The call's subject: what the operator supplied, or one derived from the task. Added in schema 3."
+          },
+          "subjectSource": {
+            "type": ["string", "null"],
+            "enum": ["operator", "derived", null],
+            "description": "Who wrote `subject`. 'operator' is a label a human typed for THIS call and identifies it; 'derived' is a machine summary of the task, which a campaign reuses across every target, so it identifies the SCRIPT and not the call. null means the record never recorded its provenance (written before this field, or awaiting POST /api/console/calls/backfill-subjects) -- treat it as 'derived', never as 'operator'. Read this WITH `subject`: a client that renders the label without it cannot tell a name from a guess, which is the regression this field exists to prevent."
+          }
+        }
+      },
+      "ScriptPreviewRequest": {
+        "type": "object",
+        "required": ["task"],
+        "properties": {
+          "task": {
+            "type": "string",
+            "maxLength": 16000,
+            "description": "MAY be empty here, unlike a call - the preview updates as the operator types."
+          },
+          "voicemail": {
+            "type": "boolean",
+            "description": "Render the variant AMD produces on voicemail. A boolean, not an amdResult string, so the browser cannot inject an arbitrary AMD value."
+          }
+        }
+      },
+      "ScriptPreview": {
+        "type": "object",
+        "required": ["segments", "text"],
+        "properties": {
+          "segments": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["label", "text"],
+              "properties": {
+                "label": {
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Labelled parts of the composed prompt, in send order, so the operator sees which text is theirs and which is fixed."
+          },
+          "text": {
+            "type": "string",
+            "description": "segments joined by newline - identical to what CallSession sends."
+          }
+        }
+      },
+      "PresetRecord": {
+        "type": "object",
+        "required": ["name", "task"],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "task": {
+            "type": "string"
+          },
+          "updatedAt": {
+            "type": "integer"
+          }
+        }
+      },
+      "Transcript": {
+        "type": "object",
+        "required": ["text"],
+        "properties": {
+          "text": {
+            "type": "string"
+          },
+          "durationSeconds": {
+            "type": "number"
+          }
+        }
+      },
+      "ScheduleSummary": {
+        "type": "object",
+        "required": ["id", "to", "runAt", "status", "createdAt"],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "to": {
+            "type": "string"
+          },
+          "runAt": {
+            "type": "integer",
+            "description": "Absolute epoch ms."
+          },
+          "status": {
+            "type": "string",
+            "enum": ["pending", "claimed", "fired", "cancelled", "failed"]
+          },
+          "subject": {
+            "type": ["string", "null"]
+          },
+          "task": {
+            "type": "string",
+            "description": "First 120 characters of the task."
+          },
+          "createdAt": {
+            "type": "integer"
+          },
+          "firedCallId": {
+            "type": ["string", "null"]
+          },
+          "timeZone": {
+            "type": "string",
+            "description": "IANA zone the runAt was chosen in. Render runAt in THIS zone, not the viewer's."
+          },
+          "failedDetail": {
+            "type": ["string", "null"],
+            "description": "Why a failed job failed: dial error, past the lateness grace window, outside calling hours, or a stranded claim."
+          }
+        }
+      },
+      "ScheduleList": {
+        "type": "object",
+        "required": ["schedules"],
+        "properties": {
+          "schedules": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ScheduleSummary"
+            }
+          }
+        }
+      },
+      "ScheduleAccepted": {
+        "type": "object",
+        "required": ["scheduleId", "status", "runAt", "to"],
+        "properties": {
+          "scheduleId": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "const": "scheduled"
+          },
+          "runAt": {
+            "type": "integer"
+          },
+          "to": {
+            "type": "string"
+          },
+          "timeZone": {
+            "type": "string",
+            "description": "IANA zone the job was scheduled in."
+          },
+          "runAtLocal": {
+            "type": "string",
+            "example": "Wed, Apr 22, 2026, 11:00 AM",
+            "description": "runAt rendered in the job's own zone. Echoed so a caller that computed epoch ms by hand can confirm it landed on the intended wall-clock time (naive arithmetic across a DST boundary lands an hour off silently)."
+          }
+        }
+      },
+      "AddParticipantRequest": {
+        "type": "object",
+        "required": ["to"],
+        "additionalProperties": false,
+        "properties": {
+          "to": {
+            "type": "string",
+            "pattern": "^\\+[1-9]\\d{6,14}$",
+            "description": "E.164 number to dial and conference in."
+          },
+          "label": {
+            "type": "string",
+            "maxLength": 60,
+            "description": "Operator's name for this person. Spoken in the join notice and named to the agent; control, zero-width and bidirectional characters are stripped before either use."
+          },
+          "supervisorRole": {
+            "type": "string",
+            "enum": ["barge", "monitor", "whisper"],
+            "default": "barge",
+            "description": "How they are wired into the conference audio. \"barge\" (the default, and what every add did before this field existed) is a normal speaking participant. \"monitor\" hears everyone and is heard by nobody. \"whisper\" is heard only by the person the call is with (leg A) -- and per Telnyx, a whisper with no target is a monitor, so on a call with no leg A the request is resolved to \"monitor\" and the roster reports \"monitor\", not the role that was asked for. Telnyx's own enum also has \"none\", which its spec says is identical to \"barge\"; it is refused here so there are not two wire values for one behaviour."
+          }
+        }
+      },
+      "Participant": {
+        "type": "object",
+        "description": "One escalation participant. Rows are appended and never removed: a departed row is what the cost model meters and what the archive records about who was on the call.",
+        "properties": {
+          "pid": {
+            "type": "string",
+            "description": "Stable per-call id (\"p0\"). Minted before the dial."
+          },
+          "legId": {
+            "type": ["string", "null"],
+            "description": "Telnyx call_control_id once dialed. Address drop/mute with this."
+          },
+          "to": {
+            "type": "string"
+          },
+          "label": {
+            "type": ["string", "null"]
+          },
+          "status": {
+            "type": "string",
+            "enum": ["queued", "dialing", "joined", "left", "failed"],
+            "description": "\"queued\" means listed on the call request but not yet dialed: participants cannot be dialed until the conference exists."
+          },
+          "answeredAt": {
+            "type": ["integer", "null"],
+            "description": "Billable start. Null means they never answered, so they cost nothing."
+          },
+          "joinedAt": {
+            "type": ["integer", "null"],
+            "description": "Conference join. Display only; billing uses answeredAt."
+          },
+          "leftAt": {
+            "type": ["integer", "null"],
+            "description": "Billable end. Null means they were still on when the call ended."
+          },
+          "muted": {
+            "type": "boolean"
+          },
+          "held": {
+            "type": "boolean",
+            "description": "On hold: they hear the conference hold audio and nobody hears them. Independent of `muted` -- both can be set, and unmuting does not resume a held leg."
+          },
+          "supervisorRole": {
+            "type": "string",
+            "enum": ["barge", "monitor", "whisper"],
+            "description": "The role as ACTUALLY JOINED. A requested \"whisper\" with nobody to whisper to reads back as \"monitor\"."
+          }
+        }
+      },
+      "CostRollup": {
+        "type": "object",
+        "description": "An ESTIMATE from published list rates, never an invoice. See the `disclaimer` field.",
+        "properties": {
+          "window": {
+            "type": "string",
+            "enum": ["day", "week", "month", "year"]
+          },
+          "startMs": {
+            "type": "integer"
+          },
+          "endMs": {
+            "type": "integer"
+          },
+          "totalUsd": {
+            "type": "number"
+          },
+          "calls": {
+            "type": "integer"
+          },
+          "averageUsdPerCall": {
+            "type": "number"
+          },
+          "byProvider": {
+            "type": "object",
+            "properties": {
+              "xai": {
+                "type": "number"
+              },
+              "telnyx": {
+                "type": "number"
+              },
+              "telnyxRecording": {
+                "type": "number"
+              }
+            }
+          },
+          "series": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "startMs": {
+                  "type": "integer"
+                },
+                "usd": {
+                  "type": "number"
+                },
+                "calls": {
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "forecast": {
+            "type": "object",
+            "description": "A projection from WHOLE elapsed days, null below two of them. Not a measurement."
+          },
+          "looseDurationCalls": {
+            "type": "integer"
+          },
+          "rateConfidence": {
+            "type": "string",
+            "enum": ["verified", "stale", "override"]
+          },
+          "truncated": {
+            "type": "boolean"
+          },
+          "estimate": {
+            "type": "boolean",
+            "enum": [true]
+          },
+          "disclaimer": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "responses": {
+      "Unauthorized": {
+        "description": "Missing or invalid credentials.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "BadRequest": {
+        "description": "Malformed body or invalid parameter.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Unconfigured": {
+        "description": "A required binding is absent in this environment.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    },
+    "parameters": {
+      "CallId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
+        "description": "Opaque call id (UUID). Validated before any downstream use."
+      },
+      "PresetName": {
+        "name": "name",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$"
+        },
+        "description": "Allowlisted: letters, digits, space, dot, underscore, hyphen; must start alphanumeric. Excluding '/' is what stops a name escaping presets/ into calls/ - Hono percent-DECODES path params."
+      }
+    }
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": ["health"],
+        "operationId": "health",
+        "summary": "Liveness probe",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Alive",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean"
+                    },
+                    "service": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/call": {
+      "post": {
+        "tags": ["calls"],
+        "operationId": "placeCall",
+        "summary": "Place an outbound AI call",
+        "description": "Dials now, or persists a deferred job when runAt is a future epoch ms. A 202 with status=scheduled did NOT dial.",
+        "security": [
+          {
+            "apiKey": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CallRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Dial accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CallAccepted"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "502": {
+            "description": "Telnyx refused the dial",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/call/schedules": {
+      "get": {
+        "tags": ["calls"],
+        "operationId": "listSchedules",
+        "summary": "List deferred outbound jobs",
+        "description": "Hermes-visible record: id, to, runAt, status, subject/task summary. Cookie console twin: GET /api/console/schedules.",
+        "security": [
+          {
+            "apiKey": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Schedule queue",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleList"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "503": {
+            "description": "Schedule store is not configured"
+          }
+        }
+      }
+    },
+    "/call/schedules/{id}": {
+      "delete": {
+        "tags": ["calls"],
+        "operationId": "cancelSchedule",
+        "summary": "Cancel a pending deferred job",
+        "security": [
+          {
+            "apiKey": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cancelled"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "Not found"
+          },
+          "409": {
+            "description": "Not pending"
+          }
+        }
+      }
+    },
+    "/call/{id}": {
+      "get": {
+        "tags": ["calls"],
+        "operationId": "getCall",
+        "summary": "Live status of one call",
+        "description": "Reads the Durable Object directly, so it works only while the call is live. After teardown use getArchivedCall.",
+        "security": [
+          {
+            "apiKey": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CallId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Call state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "Unknown call"
+          }
+        }
+      }
+    },
+    "/api/me": {
+      "get": {
+        "tags": ["console"],
+        "operationId": "whoami",
+        "summary": "Signed-in operator",
+        "security": [
+          {
+            "operatorSession": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Operator identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "authenticated": {
+                      "type": "boolean"
+                    },
+                    "user": {
+                      "type": "object"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/api/console/calls": {
+      "post": {
+        "tags": ["console"],
+        "operationId": "consolePlaceCall",
+        "summary": "Place a call from the console",
+        "security": [
+          {
+            "operatorSession": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConsoleCallRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Dial accepted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CallAccepted"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "502": {
+            "description": "Telnyx refused the dial"
+          }
+        }
+      },
+      "get": {
+        "tags": ["console"],
+        "operationId": "listCalls",
+        "summary": "Archived call log, newest first",
+        "security": [
+          {
+            "operatorSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "Opaque token from the previous page."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One page",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CallLogPage"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unconfigured"
+          },
+          "502": {
+            "description": "R2 unavailable"
+          }
+        }
+      }
+    },
+    "/api/console/calls/{id}": {
+      "get": {
+        "tags": ["console"],
+        "operationId": "getArchivedCall",
+        "summary": "One call: live state if running, else the R2 archive",
+        "security": [
+          {
+            "operatorSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CallId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Call record",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CallLogRecord"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "Unknown call"
+          }
+        }
+      }
+    },
+    "/api/console/calls/{id}/recording/{format}": {
+      "get": {
+        "tags": ["console"],
+        "operationId": "getRecording",
+        "summary": "Archived recording audio",
+        "security": [
+          {
+            "operatorSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CallId"
+          },
+          {
+            "name": "format",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": ["mp3", "wav"]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Audio bytes",
+            "content": {
+              "audio/mpeg": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "audio/wav": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "No archived recording"
+          }
+        }
+      }
+    },
+    "/api/console/calls/{id}/hangup": {
+      "post": {
+        "tags": ["console"],
+        "operationId": "hangupCall",
+        "summary": "End a live call",
+        "security": [
+          {
+            "operatorSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CallId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Hangup requested"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "Unknown call"
+          }
+        }
+      }
+    },
+    "/api/console/calls/{id}/media-token": {
+      "post": {
+        "tags": ["console"],
+        "operationId": "mintMediaToken",
+        "summary": "Short-lived token for the live-audio monitor",
+        "security": [
+          {
+            "operatorSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CallId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "token": {
+                      "type": "string"
+                    },
+                    "expiresIn": {
+                      "type": "integer",
+                      "const": 90
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "Unknown call"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unconfigured"
+          }
+        }
+      }
+    },
+    "/api/console/calls/{id}/monitor": {
+      "get": {
+        "tags": ["console"],
+        "operationId": "monitorCall",
+        "summary": "WebSocket: live call audio",
+        "description": "Upgrade required. Authorized by the media token from mintMediaToken, not by the session cookie.",
+        "security": [],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CallId"
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "Switching protocols"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unconfigured"
+          }
+        }
+      }
+    },
+    "/api/console/script-preview": {
+      "post": {
+        "tags": ["console"],
+        "operationId": "previewScript",
+        "summary": "Compose the prompt a task would produce (read-only)",
+        "description": "Returns the SAME composition CallSession sends - composeInstructions() is the single source and buildInstructions() is defined in terms of it. No route accepts an instructions blob; the console can see the prompt and never author one.",
+        "security": [
+          {
+            "operatorSession": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScriptPreviewRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Composed prompt",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScriptPreview"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/api/console/presets": {
+      "get": {
+        "tags": ["presets"],
+        "operationId": "listPresets",
+        "summary": "All saved task presets",
+        "security": [
+          {
+            "operatorSession": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Presets",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "presets": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/PresetRecord"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unconfigured"
+          }
+        }
+      }
+    },
+    "/api/console/presets/{name}": {
+      "get": {
+        "tags": ["presets"],
+        "operationId": "getPreset",
+        "summary": "One preset",
+        "security": [
+          {
+            "operatorSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PresetName"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Preset",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PresetRecord"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "Unknown preset"
+          }
+        }
+      },
+      "put": {
+        "tags": ["presets"],
+        "operationId": "savePreset",
+        "summary": "Create or update a preset",
+        "security": [
+          {
+            "operatorSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PresetName"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["task"],
+                "properties": {
+                  "task": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 16000
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Saved",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PresetRecord"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "409": {
+            "description": "Preset limit reached (50). Editing an EXISTING preset is exempt, so the cap never makes the others read-only."
+          },
+          "503": {
+            "$ref": "#/components/responses/Unconfigured"
+          }
+        }
+      },
+      "delete": {
+        "tags": ["presets"],
+        "operationId": "deletePreset",
+        "summary": "Delete a preset",
+        "security": [
+          {
+            "operatorSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/PresetName"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "deleted": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unconfigured"
+          }
+        }
+      }
+    },
+    "/api/console/transcribe": {
+      "post": {
+        "tags": ["console"],
+        "operationId": "transcribe",
+        "summary": "Transcribe operator dictation on Workers AI",
+        "description": "Raw audio bytes. Runs @cf/openai/whisper-large-v3-turbo with vad_filter:true - a CORRECTNESS requirement, not tuning: without it, silence transcribes as a confident invention (measured: 2s of silence -> 'Thank you.') and that string would be pasted into the box that dials a real number. 422 no_speech is the honest empty result.",
+        "security": [
+          {
+            "operatorSession": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "audio/webm": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            },
+            "audio/mp4": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            },
+            "audio/mpeg": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            },
+            "audio/wav": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Transcript",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Transcript"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Empty recording"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "413": {
+            "description": "Too large (8MB) or too long (120s)"
+          },
+          "415": {
+            "description": "Unsupported audio type"
+          },
+          "422": {
+            "description": "No speech detected"
+          },
+          "502": {
+            "description": "Transcription failed"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unconfigured"
+          }
+        }
+      }
+    },
+    "/api/console/calls/backfill-subjects": {
+      "post": {
+        "operationId": "backfillCallSubjects",
+        "summary": "Label already-archived calls with a subject",
+        "description": "One-shot maintenance. Calls archived before schema 3 carry their task in the record body and nothing in R2 custom metadata, which is all the list route reads -- so without this they render unlabelled. Idempotent: objects that already record WHO wrote their subject (subjectSource) are skipped, and the record body and its schema tag are never modified. The condition is deliberately not \"already has a subject\" -- an earlier version of this route wrote a derived label with no provenance beside it, so those objects both have a subject and need repairing; this run MIGRATES them, reading the record body as the authority on whether the label was operator-supplied. Bounded at 5 list pages; \"complete\": false means it stopped early and should be run again.",
+        "tags": ["console"],
+        "security": [
+          {
+            "operatorSession": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Counts for the run.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "scanned": {
+                      "type": "integer"
+                    },
+                    "updated": {
+                      "type": "integer"
+                    },
+                    "skipped": {
+                      "type": "integer"
+                    },
+                    "failed": {
+                      "type": "integer"
+                    },
+                    "complete": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Call log is not configured.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Backfill failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/console/schedules": {
+      "get": {
+        "tags": ["console"],
+        "operationId": "consoleListSchedules",
+        "summary": "List deferred outbound jobs",
+        "security": [
+          {
+            "operatorSession": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Schedule queue",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleList"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
+    "/api/console/schedules/{id}": {
+      "delete": {
+        "tags": ["console"],
+        "operationId": "consoleCancelSchedule",
+        "summary": "Cancel a pending deferred job",
+        "security": [
+          {
+            "operatorSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cancelled"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "description": "Not found"
+          }
+        }
+      }
+    },
+    "/api/console/calls/{id}/participants": {
+      "post": {
+        "summary": "Conference a number into a live call",
+        "description": "Dial a number and conference it into a LIVE call. The person hears nothing until they answer; on answer their leg is joined to the conference and a spoken notice naming them and stating that the call is recorded is played to EVERY participant. They join unmuted and un-held, and by default speaking -- see `supervisorRole` for the alternatives. An escalation participant hanging up does NOT end the call.",
+        "security": [
+          {
+            "operatorSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CallId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddParticipantRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Dialing has started; the roster row is returned.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "participant": {
+                      "$ref": "#/components/schemas/Participant"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid call id or body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The call has ended, the participant cap is reached, or this number is already on the call. Adds are idempotent against an active participant, so a retried request does NOT place a second call.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/console/calls/{id}/participants/{legId}": {
+      "delete": {
+        "summary": "Drop a participant",
+        "description": "Remove a participant by HANGING UP their leg. Not the conference `leave` action, which Telnyx documents as parking the leg -- still up, still billing, connected to nothing.",
+        "security": [
+          {
+            "operatorSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CallId"
+          },
+          {
+            "name": "legId",
+            "in": "path",
+            "required": true,
+            "description": "Telnyx call_control_id of the participant's leg, from the `participants[].legId` field of GET /api/console/calls/{id}.",
+            "schema": {
+              "type": "string",
+              "maxLength": 200,
+              "pattern": "^[A-Za-z0-9_=+/-]+$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The participant's leg is being hung up.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "dropped": {
+                      "type": "boolean"
+                    },
+                    "pid": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No participant on this call holds that leg id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/console/calls/{id}/participants/{legId}/{action}": {
+      "post": {
+        "summary": "Mute, unmute, hold or unhold one participant",
+        "description": "Act on exactly ONE participant, never the whole conference. Mute stops them being heard while they keep hearing the call; hold also stops them hearing it and plays the conference hold audio. The two are independent: unmuting does not resume a held leg. The leg id is required and is matched against the roster before any provider call -- Telnyx reads an empty `call_control_ids` on mute and hold as EVERY participant, so an unmatched leg id is a 404 here rather than a command that freezes the subject and the agent.",
+        "security": [
+          {
+            "operatorSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CallId"
+          },
+          {
+            "name": "legId",
+            "in": "path",
+            "required": true,
+            "description": "Telnyx call_control_id of the participant's leg, from the `participants[].legId` field of GET /api/console/calls/{id}.",
+            "schema": {
+              "type": "string",
+              "maxLength": 200,
+              "pattern": "^[A-Za-z0-9_=+/-]+$"
+            }
+          },
+          {
+            "name": "action",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": ["mute", "unmute", "hold", "unhold"]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The requested state, as the roster now records it. A mute/unmute request answers with `muted`; a hold/unhold request answers with `held`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "pid": {
+                      "type": "string"
+                    },
+                    "muted": {
+                      "type": "boolean"
+                    },
+                    "held": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No participant on this call holds that leg id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/call/{id}/participants": {
+      "post": {
+        "summary": "Conference a number into a live call (API key)",
+        "description": "Dial a number and conference it into a LIVE call. The person hears nothing until they answer; on answer their leg is joined to the conference and a spoken notice naming them and stating that the call is recorded is played to EVERY participant. They join unmuted and un-held, and by default speaking -- see `supervisorRole` for the alternatives. An escalation participant hanging up does NOT end the call. Same Durable Object, same reducer, same cap as the console route.",
+        "security": [
+          {
+            "apiKey": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CallId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddParticipantRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Dialing has started; the roster row is returned.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "participant": {
+                      "$ref": "#/components/schemas/Participant"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid call id or body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The call has ended, the participant cap is reached, or this number is already on the call. Adds are idempotent against an active participant, so a retried request does NOT place a second call.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/call/{id}/participants/{legId}": {
+      "delete": {
+        "summary": "Drop a participant (API key)",
+        "description": "Remove a participant by HANGING UP their leg. Not the conference `leave` action, which Telnyx documents as parking the leg -- still up, still billing, connected to nothing.",
+        "security": [
+          {
+            "apiKey": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CallId"
+          },
+          {
+            "name": "legId",
+            "in": "path",
+            "required": true,
+            "description": "Telnyx call_control_id of the participant's leg, from the `participants[].legId` field of GET /api/console/calls/{id}.",
+            "schema": {
+              "type": "string",
+              "maxLength": 200,
+              "pattern": "^[A-Za-z0-9_=+/-]+$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The participant's leg is being hung up.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "dropped": {
+                      "type": "boolean"
+                    },
+                    "pid": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No participant on this call holds that leg id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/call/{id}/participants/{legId}/{action}": {
+      "post": {
+        "summary": "Mute, unmute, hold or unhold one participant",
+        "description": "Act on exactly ONE participant, never the whole conference. Mute stops them being heard while they keep hearing the call; hold also stops them hearing it and plays the conference hold audio. The two are independent: unmuting does not resume a held leg. The leg id is required and is matched against the roster before any provider call -- Telnyx reads an empty `call_control_ids` on mute and hold as EVERY participant, so an unmatched leg id is a 404 here rather than a command that freezes the subject and the agent.",
+        "security": [
+          {
+            "apiKey": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CallId"
+          },
+          {
+            "name": "legId",
+            "in": "path",
+            "required": true,
+            "description": "Telnyx call_control_id of the participant's leg, from the `participants[].legId` field of GET /api/console/calls/{id}.",
+            "schema": {
+              "type": "string",
+              "maxLength": 200,
+              "pattern": "^[A-Za-z0-9_=+/-]+$"
+            }
+          },
+          {
+            "name": "action",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": ["mute", "unmute", "hold", "unhold"]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The requested state, as the roster now records it. A mute/unmute request answers with `muted`; a hold/unhold request answers with `held`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "pid": {
+                      "type": "string"
+                    },
+                    "muted": {
+                      "type": "boolean"
+                    },
+                    "held": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No participant on this call holds that leg id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/console/costs": {
+      "get": {
+        "summary": "Estimated spend over a period",
+        "description": "Aggregate estimated cost across every archived call whose end time falls in the window. Priced at READ time from stored duration, so calls archived before the cost model existed are included with no backfill. `looseDurationCalls` counts the rows metered over total wall time because they predate the recorded answer instant -- those run HIGH by their ring time. `truncated: true` means the page cap was hit and the total is a FLOOR, not the answer. Participant legs on conference calls are included in the Telnyx line.",
+        "security": [
+          {
+            "operatorSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "window",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": ["day", "week", "month", "year"],
+              "default": "month"
+            },
+            "description": "UTC period. A Worker has no user timezone, and inventing one would shift day boundaries."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Estimated spend, itemised by provider and bucketed over time.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CostRollup"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The call-log bucket is not configured.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

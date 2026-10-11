@@ -1,0 +1,16 @@
+# Throwaway probe Worker used ONLY to measure REAL R2 behaviour that the unit
+# tests then mirror in their in-memory fake: list() ordering, whether
+# include:['customMetadata'] round-trips, and what R2 does with a non-ASCII
+# custom-metadata value (it travels as an HTTP header).
+#
+# Run with:
+#   ./node_modules/.bin/wrangler dev --remote -c tools/repro/r2-call-log/wrangler.toml --port 8799
+# NEVER `wrangler deploy` this.
+name = "open-grok-voice-r2-probe"
+main = "probe.ts"
+compatibility_date = "2026-08-01"
+workers_dev = false
+
+[[r2_buckets]]
+binding = "CALL_LOGS"
+bucket_name = "open-grok-voice-call-logs"

@@ -1,0 +1,13 @@
+# LOCAL HARNESS ONLY. Different worker name so it can never be confused with
+# the real one, and it has NO operator auth -- see worker.ts.
+name = "open-grok-voice-console-probe"
+main = "worker.ts"
+compatibility_date = "2026-08-01"
+workers_dev = false
+
+[ai]
+binding = "AI"
+
+[[r2_buckets]]
+binding = "CALL_LOGS"
+bucket_name = "open-grok-voice-console-probe-local"

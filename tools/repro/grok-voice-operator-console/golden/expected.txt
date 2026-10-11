@@ -1,0 +1,4 @@
+Targeted operator-console regression harness expectations:
+- TypeScript exits 0.
+- Six focused Vitest files pass with no unhandled errors.
+- Local `wrangler dev --local` probe serves `/health` and verifies anonymous console/API protection.

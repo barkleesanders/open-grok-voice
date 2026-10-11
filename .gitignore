@@ -1,0 +1,13 @@
+node_modules/
+.wrangler/
+dist/
+*.log
+*.tsbuildinfo
+.dev.vars
+.env
+# Key files must never be committed (generic pattern; the CLIs also read
+# .app_api_key.txt at the repo root when APP_API_KEY is unset).
+*_api_key.txt
+*.txt
+# ...except committed fixtures:
+!tools/repro/grok-voice-operator-console/golden/expected.txt

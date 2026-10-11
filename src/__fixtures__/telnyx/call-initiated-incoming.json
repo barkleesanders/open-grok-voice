@@ -1,0 +1,24 @@
+{
+  "__note__": "SYNTHETIC fixture. No inbound call has been captured yet; this shape is derived from Telnyx's documented call.initiated webhook payload (developers.telnyx.com call-control callbacks): direction 'incoming', no client_state, state 'parked' until answered. Replace with a captured payload when one exists.",
+  "data": {
+    "record_type": "event",
+    "event_type": "call.initiated",
+    "id": "0ccc7b54-4df3-4bca-a65a-3da1ecc777f0",
+    "occurred_at": "2026-08-27T18:10:02.574362Z",
+    "payload": {
+      "call_control_id": "v3:TnlwYWxJTlBOVGdmS0ZDcmpsZFhRRW53WWpsTUlJVGxjTFZOSTBnV1hpUT0",
+      "call_leg_id": "428c31b6-7af4-4bcb-8f8f-1d821e1e5cbd",
+      "call_session_id": "428c31b6-abf3-3bc1-b7f4-01d821e1e5cbd",
+      "connection_id": "0000000000000000000",
+      "client_state": null,
+      "direction": "incoming",
+      "from": "+15555550123",
+      "to": "+15555550100",
+      "state": "parked"
+    }
+  },
+  "meta": {
+    "attempt": 1,
+    "delivered_to": "https://open-grok-voice.example.com/telnyx-webhook"
+  }
+}

@@ -1,0 +1,9 @@
+# Local-only harness. Deliberately NOT the production worker name and NOT wired
+# to any real bucket: `wrangler dev --local` backs this with miniflare's R2.
+name = "recording-range-repro"
+main = "worker.ts"
+compatibility_date = "2026-08-01"
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "recording-range-repro"

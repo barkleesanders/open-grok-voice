@@ -1,0 +1,175 @@
+# open-grok-voice -- outbound calling for xAI Grok Voice via Telnyx.
+#
+# ALWAYS pass an explicit config to wrangler:
+#   ./node_modules/.bin/wrangler dev --local -c ./wrangler.toml
+# wrangler searches UP the directory tree for a config, and a stray
+# wrangler.jsonc in $HOME can otherwise shadow this file and target the wrong
+# Worker.
+
+name = "open-grok-voice"
+main = "src/index.ts"
+compatibility_date = "2026-08-01"
+# Better Auth's Cloudflare bundle uses the Workers-supported node:crypto and
+# node:async_hooks compatibility shims. Without this flag workerd rejects the
+# bundle before the local Worker can serve a request.
+compatibility_flags = ["nodejs_compat"]
+
+# The two webhook routes MUST be publicly reachable -- Telnyx and xAI cannot
+# pass through Cloudflare Access. They are protected by cryptographic signature
+# verification instead (Ed25519 / Standard Webhooks HMAC), and /call +
+# /call/:id are protected by the X-API-Key constant-time check.
+# For production, prefer a custom domain over the workers.dev hostname:
+#   routes = [{ pattern = "voice.example.com", custom_domain = true }]
+workers_dev = true
+preview_urls = false
+
+# Minute tick: claim-and-dial any due scheduled job. The job's runAt is the
+# horizon; this handler must stay short (claim + startCall), never hold a live
+# CallSession. 15-minute Durable Object alarm wall-time is execution, not delay.
+[triggers]
+crons = ["* * * * *"]
+
+# Call-control CPU work is trivial (media relay lives in MonitorSession: JSON
+# parse, HMAC, a few fetches here).
+# Raised above the 30s default purely as headroom -- a long call spends its
+# time waiting on I/O, which does not count against CPU time.
+# Runtime logs. Set here and NOT only via the API, because a deploy from a
+# config with no observability block RESETS a runtime-enabled Worker to OFF --
+# so the API patch fixes the present and this block is the regression guard.
+# head_sampling_rate defaults to 1, stated explicitly so a future reader does
+# not read its absence as sampling. Requires wrangler >= 3.78.6; below that
+# the key parses and is silently ignored at deploy.
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[limits]
+cpu_ms = 300000
+
+# --- Durable Object ---------------------------------------------------------
+# One instance per call, addressed by idFromName(callId). A single well-known
+# instance named "__registry__" doubles as the pending-call registry.
+[[durable_objects.bindings]]
+name = "CALL_SESSION"
+class_name = "CallSession"
+
+[[durable_objects.bindings]]
+name = "MONITOR_SESSION"
+class_name = "MonitorSession"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["CallSession"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["MonitorSession"]
+
+# --- Non-secret vars --------------------------------------------------------
+[vars]
+# Telnyx Voice API Application (Call Control) connection id.
+# REPLACE_ME: the numeric connection id from the Telnyx portal
+# (Voice API Application -> Call Control).
+TELNYX_CONNECTION_ID = "REPLACE_ME"
+# E.164 number Telnyx dials FROM (must be on the connection above).
+# REPLACE_ME: e.g. "+15555550100".
+TELNYX_FROM_NUMBER = "REPLACE_ME"
+# The E.164 number registered with xAI as origin="byo_trunk" (setup step 3).
+# Usually the same number as TELNYX_FROM_NUMBER.
+# REPLACE_ME: e.g. "+15555550100".
+XAI_PHONE_NUMBER = "REPLACE_ME"
+# xAI SIP host. Verified from docs.x.ai: sip:{number}@sip.voice.x.ai;transport=tls
+XAI_SIP_HOST = "sip.voice.x.ai"
+# Public https base URL of THIS Worker. Telnyx posts call events here.
+# REPLACE_ME: e.g. "https://open-grok-voice.<your-subdomain>.workers.dev".
+PUBLIC_BASE_URL = "REPLACE_ME"
+# Built-in voice id used when POST /call omits one.
+# Roster: GET https://api.x.ai/v1/tts/voices  (eve is xAI's documented default).
+DEFAULT_VOICE = "liora"
+# Public booking page the agent may offer when scheduling comes up.
+# REPLACE_ME: e.g. "https://cal.com/your-username".
+CALCOM_BOOKING_URL = "REPLACE_ME"
+# OVERRIDE for the conference join notice's TTS voice. LEFT UNSET ON PURPOSE.
+#
+# Unset, the notice is spoken in THIS CALL'S OWN agent voice (xAI.<voice>, so
+# xAI.liora for the DEFAULT_VOICE above) rather than by a stranger cutting into
+# the conversation. Verified against POST /v2/text-to-speech/speech with an
+# armed negative control: xAI.liora -> 200 + 39,168 bytes of audio,
+# xAI.not_a_real_voice -> 400 "Voice 'not_a_real_voice' not found".
+#
+# Set it only to pin ONE notice voice across every call regardless of the agent
+# voice. Telnyx's <Provider>.<Model>.<VoiceId> namespace, not an xAI voice id.
+# CONFERENCE_NOTICE_VOICE = "Telnyx.KokoroTTS.af"
+# Set to "false" to stop transcribing the CALLER's audio (saves cost, but the
+# user side of GET /call/:id transcript goes empty).
+XAI_INPUT_TRANSCRIPTION = "true"
+# Better Auth uses the canonical Worker origin unless this is set explicitly.
+# REPLACE_ME: only needed when the auth origin differs from PUBLIC_BASE_URL.
+# BETTER_AUTH_URL = "REPLACE_ME"
+# Optional exact comma-separated origins for a future custom operator hostname.
+# BETTER_AUTH_TRUSTED_ORIGINS = "https://voice.example.com"
+# Set to "mp3" to request MP3 instead of the default dual-channel WAV.
+# RECORDING_FORMAT = "wav"
+# Optional exact/suffix allowlist for Telnyx's signed recording storage host.
+# RECORDING_HOST_ALLOWLIST = "s3.amazonaws.com"
+
+# --- Inbound routing --------------------------------------------------------
+# Comma-separated E.164 numbers whose inbound calls skip follow-me and go
+# straight to the AI as a direct assistant session (the operator calling their
+# own agent). Caller ID is spoofable — convenience, not authentication. Empty:
+# nobody is allowlisted.
+INBOUND_ALLOWLIST = ""
+# Comma-separated E.164 follow-me targets, in priority order, rung with AMD on
+# the forward leg. Empty: every non-allowlisted inbound call goes straight to
+# the AI (safe degraded mode, not an error).
+FORWARD_TARGETS = ""
+# Seconds to ring each forward target before advancing (5-120; default 20).
+INBOUND_RING_SECS = "20"
+
+# --- Secrets ----------------------------------------------------------------
+# Set these with `wrangler secret put <NAME> -c ./wrangler.toml`.
+# NEVER put their values in this file or any other committed file.
+#
+#   XAI_API_KEY         xAI API key ("xai-..."). Authenticates the realtime WS.
+#   XAI_WEBHOOK_SECRET  The `dispatch_signing_secret` ("whsec_...") returned
+#                       ONCE by POST https://api.x.ai/v2/phone-numbers.
+#                       xAI cannot recover it later -- store it on creation.
+#   TELNYX_API_KEY      Telnyx V2 API key (Bearer).
+#   TELNYX_PUBLIC_KEY   Telnyx account Ed25519 webhook PUBLIC key (base64),
+#                       from portal.telnyx.com/#/api-keys/public-key
+#   APP_API_KEY         Long random string callers send as X-API-Key.
+#   BETTER_AUTH_SECRET  At least 32 random characters for Better Auth cookies.
+#   GOOGLE_CLIENT_ID    Google OAuth web client id.
+#   GOOGLE_CLIENT_SECRET Google OAuth web client secret.
+#
+# Local dev only: ALLOW_UNSIGNED_WEBHOOKS="true" disables signature checks.
+# Never set it in production.
+
+# --- Better Auth D1 ---------------------------------------------------------
+[[d1_databases]]
+binding = "DB"
+# REPLACE_ME: create with `wrangler d1 create <name>`, then paste the name and
+# id wrangler prints.
+database_name = "REPLACE_ME"
+database_id = "REPLACE_ME"
+# Apply migrations with an explicit config:
+#   ./node_modules/.bin/wrangler d1 migrations apply <database-name> --remote -c ./wrangler.toml
+# Better Auth secrets are set separately, never in [vars].
+
+# --- Workers AI -------------------------------------------------------------
+# Transcribes the operator's dictation for the console task box. Model:
+# @cf/openai/whisper-large-v3-turbo (see src/transcribe.ts for why that one).
+# No provisioning step -- the binding is available on the account as-is.
+[ai]
+binding = "AI"
+
+# --- Durable call log (R2) --------------------------------------------------
+# One JSON record per finished call under calls/, plus archived recording bytes
+# under recordings/<callId>/. The bucket is what makes past calls ENUMERABLE:
+# a Durable Object is addressed by idFromName(callId), and nothing lists those
+# names, so before this the console could not find a call once the tab closed.
+# Archiving the audio also outlives Telnyx's short-lived signed recording URLs.
+#   ./node_modules/.bin/wrangler r2 bucket create open-grok-voice-call-logs -c ./wrangler.toml
+[[r2_buckets]]
+binding = "CALL_LOGS"
+bucket_name = "open-grok-voice-call-logs"

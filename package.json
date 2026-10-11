@@ -1,0 +1,29 @@
+{
+  "dependencies": {
+    "better-auth": "1.7.2",
+    "hono": "^4.12.34",
+    "zod": "^4.1.13"
+  },
+  "description": "Outbound phone calls for xAI Grok Voice (an inbound-only speech-to-speech agent), by having Telnyx originate both legs and bridge them carrier-side.",
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.12",
+    "@cloudflare/workers-types": "^5.20260727.1",
+    "@types/node": "^26.4.1",
+    "typescript": "^5.7.2",
+    "vitest": "^3.2.7",
+    "wrangler": "^4.129.1"
+  },
+  "name": "open-grok-voice",
+  "private": true,
+  "scripts": {
+    "check": "npm run typecheck && npm run test && npm run dryrun",
+    "deploy": "wrangler deploy -c ./wrangler.toml",
+    "dev": "wrangler dev -c ./wrangler.toml",
+    "dryrun": "wrangler deploy --dry-run -c ./wrangler.toml",
+    "secret": "wrangler secret -c ./wrangler.toml",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "type": "module",
+  "version": "0.1.0"
+}
