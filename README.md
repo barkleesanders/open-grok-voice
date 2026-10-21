@@ -99,6 +99,10 @@ this repo — each one costs money or creates real infrastructure.
 
 ## Setup — what a human must do before the first call
 
+Use Node.js 22.12 or a current Node.js 24+ release. Run `npm ci` and
+`npm run check` before configuring production accounts. The check runs lint,
+TypeScript, tests, the dependency audit, and a Worker build without deployment.
+
 1. **Telnyx**: create a Voice API Application (Call Control). Note the
    `connection_id`. In *Inbound settings* set destination number format to
    **E.164**. Enable at least one of **G.711 µ-law, G.711 A-law, G.722** — xAI
