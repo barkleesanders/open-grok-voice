@@ -10,16 +10,20 @@
     "@cloudflare/workers-types": "^5.20260727.1",
     "@types/node": "^26.4.1",
     "typescript": "^5.7.2",
-    "vitest": "^5.0.5",
-    "wrangler": "^4.129.1"
+    "vitest": "^4.1.12",
+    "wrangler": "^4.151.3"
   },
   "name": "open-grok-voice",
   "private": true,
+  "engines": {
+    "node": "^22.12.0 || >=24.0.0"
+  },
   "scripts": {
-    "check": "npm run typecheck && npm run test && npm run dryrun",
+    "check": "npm run lint && npm run typecheck && npm run test && npm audit && npm run dryrun",
     "deploy": "wrangler deploy -c ./wrangler.toml",
     "dev": "wrangler dev -c ./wrangler.toml",
     "dryrun": "wrangler deploy --dry-run -c ./wrangler.toml",
+    "lint": "biome check .",
     "secret": "wrangler secret -c ./wrangler.toml",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
