@@ -11,7 +11,7 @@
     "@types/node": "^26.4.1",
     "typescript": "^5.7.2",
     "vitest": "^4.1.12",
-    "wrangler": "^4.151.3"
+    "wrangler": "^4.156.0"
   },
   "name": "open-grok-voice",
   "private": true,
