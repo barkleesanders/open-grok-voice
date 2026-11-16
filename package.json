@@ -1,6 +1,6 @@
 {
   "dependencies": {
-    "better-auth": "1.7.2",
+    "better-auth": "1.7.25",
     "hono": "^4.13.11",
     "zod": "^4.1.13"
   },
